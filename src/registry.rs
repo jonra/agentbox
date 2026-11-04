@@ -219,15 +219,65 @@ pub fn pull(store: &Store, image: &str, quiet: bool) -> Result<ImageMeta> {
 
     let config_digest = manifest["config"]["digest"].as_str().ok_or_else(|| anyhow!("manifest has no config"))?;
     let config: Value = serde_json::from_slice(&fs::read(c.blob(store, config_digest, true)?)?)?;
-    let layers: Vec<(String, String)> = manifest["layers"]
-        .as_array()
-        .ok_or_else(|| anyhow!("manifest has no layers"))?
-        .iter()
-        .map(|l| (l["digest"].as_str().unwrap_or_default().to_string(), l["mediaType"].as_str().unwrap_or_default().to_string()))
-        .collect();
+    let mut layers = vec![];
+    for l in manifest["layers"].as_array().ok_or_else(|| anyhow!("manifest has no layers"))? {
+        let d = l["digest"].as_str().unwrap_or_default();
+        layers.push((c.blob(store, d, quiet)?, l["mediaType"].as_str().unwrap_or_default().to_string()));
+    }
+    install(store, &canonical, digest, &config, &layers)
+}
 
-    // Extract into a staging dir, then swap it in, so a failed pull never leaves a broken image.
-    let image_dir = store.image_dir(&canonical);
+/// Import images from a `docker save` archive (legacy or OCI layout; both carry a
+/// top-level manifest.json). `-` reads the archive from stdin. `tag` renames a
+/// single-image archive.
+pub fn load(store: &Store, archive: &str, tag: Option<&str>) -> Result<Vec<ImageMeta>> {
+    let tmp = store.data.join(format!(".load-{}", std::process::id()));
+    if tmp.exists() {
+        remove_tree(&tmp)?;
+    }
+    fs::create_dir_all(&tmp)?;
+    let result = (|| {
+        let input: Box<dyn Read> =
+            if archive == "-" { Box::new(io::stdin().lock()) } else { Box::new(BufReader::new(File::open(archive)?)) };
+        let mut ar = tar::Archive::new(input);
+        for entry in ar.entries()? {
+            entry?.unpack_in(&tmp)?; // unpack_in refuses paths escaping tmp
+        }
+        let manifest: Value = serde_json::from_slice(&fs::read(tmp.join("manifest.json")).context("archive has no manifest.json; is it a `docker save` tarball?")?)?;
+        let entries = manifest.as_array().ok_or_else(|| anyhow!("manifest.json is not a list"))?;
+        if tag.is_some() && entries.len() != 1 {
+            bail!("--tag needs an archive with exactly one image ({} found)", entries.len());
+        }
+        let mut out = vec![];
+        for e in entries {
+            let name = match tag {
+                Some(t) => t.to_string(),
+                None => e["RepoTags"][0].as_str().ok_or_else(|| anyhow!("image without a tag in archive; pass --tag"))?.to_string(),
+            };
+            let canonical = Reference::parse(&name)?.canonical();
+            let config_path = tmp.join(e["Config"].as_str().ok_or_else(|| anyhow!("manifest entry without Config"))?);
+            let config_bytes = fs::read(&config_path)?;
+            let digest = format!("sha256:{:x}", Sha256::digest(&config_bytes));
+            let config: Value = serde_json::from_slice(&config_bytes)?;
+            let layers: Vec<(PathBuf, String)> = e["Layers"]
+                .as_array()
+                .ok_or_else(|| anyhow!("manifest entry without Layers"))?
+                .iter()
+                .map(|l| (tmp.join(l.as_str().unwrap_or_default()), String::new()))
+                .collect();
+            eprintln!("loading {canonical} ({} layers)", layers.len());
+            out.push(install(store, &canonical, digest, &config, &layers)?);
+        }
+        Ok(out)
+    })();
+    let _ = remove_tree(&tmp);
+    result
+}
+
+/// Build an image's rootfs from its layer files and record its metadata. Extracts into a
+/// staging dir and swaps it in, so a failure never leaves a half-built image behind.
+fn install(store: &Store, canonical: &str, digest: String, config: &Value, layers: &[(PathBuf, String)]) -> Result<ImageMeta> {
+    let image_dir = store.image_dir(canonical);
     let staging = image_dir.with_extension("staging");
     if staging.exists() {
         remove_tree(&staging)?;
@@ -235,10 +285,9 @@ pub fn pull(store: &Store, image: &str, quiet: bool) -> Result<ImageMeta> {
     let rootfs = staging.join("rootfs");
     fs::create_dir_all(&rootfs)?;
     let mut size = 0;
-    for (d, media) in &layers {
-        let blob = c.blob(store, d, quiet)?;
-        size += fs::metadata(&blob)?.len();
-        extract_layer(&blob, media, &rootfs).with_context(|| format!("extracting layer {d}"))?;
+    for (blob, media) in layers {
+        size += fs::metadata(blob)?.len();
+        extract_layer(blob, media, &rootfs).with_context(|| format!("extracting layer {}", blob.display()))?;
     }
 
     let cfg = &config["config"];
@@ -246,7 +295,7 @@ pub fn pull(store: &Store, image: &str, quiet: bool) -> Result<ImageMeta> {
         v.as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect()).unwrap_or_default()
     };
     let meta = ImageMeta {
-        reference: canonical.clone(),
+        reference: canonical.to_string(),
         digest,
         env: strings(&cfg["Env"]),
         entrypoint: strings(&cfg["Entrypoint"]),

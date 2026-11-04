@@ -6,7 +6,8 @@
 //!   data/                   mount point (or a plain dir on Linux / AGENTBOX_NO_VOLUME=1)
 //!     blobs/sha256/<hex>    cached layer/config blobs
 //!     images/<key>/         image.json + rootfs/
-//!     containers/<name>/    rootfs/ (cloned from the image) + container.json
+//!     containers/<id>/      see container.rs
+//!     volumes/<name>/       named volumes (`-v name:/path`)
 //! ```
 //!
 //! Linux root filesystems contain paths that differ only by case (terminfo, perl, ...),
@@ -41,13 +42,6 @@ pub struct ImageMeta {
     pub size_bytes: u64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ContainerMeta {
-    pub name: String,
-    pub image: String,
-    pub created: u64,
-}
-
 impl Store {
     pub fn open() -> Result<Store> {
         let home = match std::env::var_os("AGENTBOX_HOME") {
@@ -65,7 +59,7 @@ impl Store {
             }
             fs::write(&marker, b"agentbox store\n")?;
         }
-        for d in ["blobs/sha256", "images", "containers"] {
+        for d in ["blobs/sha256", "images", "containers", "volumes"] {
             fs::create_dir_all(data.join(d))?;
         }
         Ok(Store { data })
@@ -80,8 +74,24 @@ impl Store {
         self.data.join("images").join(key(reference))
     }
 
-    pub fn container_dir(&self, name: &str) -> PathBuf {
-        self.data.join("containers").join(key(name))
+    pub fn container_dir(&self, id: &str) -> PathBuf {
+        self.data.join("containers").join(key(id))
+    }
+
+    pub fn volume_dir(&self, name: &str) -> Result<PathBuf> {
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c)) || name.starts_with('.') {
+            bail!("invalid volume name {name:?}");
+        }
+        Ok(self.data.join("volumes").join(name))
+    }
+
+    pub fn volumes(&self) -> Result<Vec<String>> {
+        let mut out: Vec<String> = fs::read_dir(self.data.join("volumes"))?
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        out.sort();
+        Ok(out)
     }
 
     pub fn image(&self, reference: &str) -> Result<Option<ImageMeta>> {
@@ -104,30 +114,10 @@ impl Store {
         Ok(out)
     }
 
-    pub fn containers(&self) -> Result<Vec<ContainerMeta>> {
-        let mut out = vec![];
-        for e in fs::read_dir(self.data.join("containers"))? {
-            let p = e?.path().join("container.json");
-            if let Ok(b) = fs::read(&p) {
-                out.push(serde_json::from_slice(&b)?);
-            }
-        }
-        out.sort_by(|a: &ContainerMeta, b| a.name.cmp(&b.name));
-        Ok(out)
-    }
-
     pub fn remove_image(&self, reference: &str) -> Result<()> {
         let d = self.image_dir(reference);
         if !d.exists() {
             bail!("no such image: {reference}");
-        }
-        remove_tree(&d)
-    }
-
-    pub fn remove_container(&self, name: &str) -> Result<()> {
-        let d = self.container_dir(name);
-        if !d.exists() {
-            bail!("no such container: {name}");
         }
         remove_tree(&d)
     }
