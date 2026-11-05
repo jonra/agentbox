@@ -40,6 +40,12 @@ pub struct ImageMeta {
     #[serde(default)]
     pub user: String,
     pub size_bytes: u64,
+    /// "8080/tcp" style, from EXPOSE.
+    #[serde(default)]
+    pub exposed_ports: Vec<String>,
+    /// Docker's config.Healthcheck object ({Test, Interval, Timeout, Retries, StartPeriod}).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<serde_json::Value>,
 }
 
 impl Store {

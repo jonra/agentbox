@@ -48,6 +48,15 @@ pub struct RunOpts {
     /// Delete the container when it exits.
     #[serde(default)]
     pub rm: bool,
+    /// Extra /etc/hosts entries, "name:ip" (`--add-host`; compose service names).
+    #[serde(default)]
+    pub extra_hosts: Vec<String>,
+    /// In-guest TCP forwarders "listen_ip:port=target_ip:port" (compose service names).
+    #[serde(default)]
+    pub forwards: Vec<String>,
+    /// Free-form labels (compose project/service bookkeeping).
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 /// Everything the `__vm` child needs; passed to it as JSON in an env var.
@@ -60,7 +69,9 @@ pub struct VmSpec {
     workdir: String,
     cpus: u8,
     memory_mib: u32,
-    ports: Vec<String>,
+    /// None: every port the guest listens on is exposed on the host at the same number.
+    /// Some(list): only these "host:guest" mappings (empty = nothing exposed).
+    ports: Option<Vec<String>>,
     virtiofs: Vec<(String, String)>,
     network: bool,
 }
@@ -110,53 +121,134 @@ const EXECD: &str = r#"__agentbox_execd() {
 ( __agentbox_execd ) >/dev/null 2>&1 </dev/null &
 "#;
 
+/// The static in-guest helper (guest/), when this build embeds one.
+#[cfg(guest_helper)]
+pub const GUEST_HELPER: Option<&[u8]> = Some(include_bytes!(env!("AGENTBOX_GUEST_HELPER")));
+#[cfg(not(guest_helper))]
+pub const GUEST_HELPER: Option<&[u8]> = None;
+
+/// What to boot: a rootfs plus the process to run in it.
+pub struct GuestRun<'a> {
+    pub rootfs: &'a Path,
+    /// For error messages.
+    pub what: &'a str,
+    pub argv: Vec<String>,
+    pub env: Vec<String>,
+    pub workdir: String,
+    /// Normalized "abs_host:guest[:ro]".
+    pub volumes: Vec<String>,
+    pub ports: Option<Vec<String>>,
+    pub extra_hosts: Vec<String>,
+    pub forwards: Vec<String>,
+    pub cpus: u8,
+    pub memory_mib: u32,
+    pub network: bool,
+    /// Start the guest exec helper (containers; not build steps).
+    pub execd: bool,
+}
+
 /// Build the VM configuration for starting `c`, writing the per-start files
 /// (resolv.conf, hosts, entry.sh) into its rootfs.
 pub fn build_spec(store: &Store, c: &Container) -> Result<VmSpec> {
     let image = store.image(&c.image)?.ok_or_else(|| anyhow!("image {} of container {} is gone", c.image, c.name))?;
     let o = &c.config;
     let rootfs = store.container_dir(&c.id).join("rootfs");
-    write_network_files(&rootfs)?;
-
     let mut argv = o.entrypoint.clone().unwrap_or_else(|| image.entrypoint.clone());
     argv.extend(if o.command.is_empty() { image.cmd.clone() } else { o.command.clone() });
     if argv.is_empty() {
         bail!("no command given and image {} has no default command", image.reference);
     }
-    let env = effective_env(&image, o);
-    let workdir = effective_workdir(&image, o);
+    let network = o.network.unwrap_or(true);
+    if !network && !o.ports.is_empty() {
+        bail!("port mappings need networking");
+    }
+    prepare(&GuestRun {
+        rootfs: &rootfs,
+        what: &image.reference,
+        argv,
+        env: effective_env(&image, o),
+        workdir: effective_workdir(&image, o),
+        volumes: o.volumes.clone(),
+        // Without a port map libkrun exposes every port the guest listens on, at its own
+        // number (this libkrun also treats an empty map that way).
+        ports: if o.ports.is_empty() { None } else { Some(o.ports.clone()) },
+        extra_hosts: o.extra_hosts.clone(),
+        forwards: o.forwards.clone(),
+        cpus: o.cpus.unwrap_or(2),
+        memory_mib: o.memory_mib.unwrap_or(1024),
+        network,
+        execd: true,
+    })
+}
+
+pub fn prepare(g: &GuestRun) -> Result<VmSpec> {
+    let rootfs = g.rootfs;
+    write_network_files(rootfs, &g.extra_hosts)?;
+    let (argv, env, workdir) = (&g.argv, &g.env, &g.workdir);
 
     // Volumes are virtio-fs shares that the guest has to mount itself.
     let mut virtiofs = vec![];
     let mut mounts = vec![];
-    for (i, v) in o.volumes.iter().enumerate() {
+    for (i, v) in g.volumes.iter().enumerate() {
         let (host, guest, ro) = split_volume(v)?;
         let tag = format!("vol{i}");
-        mounts.push(format!(
-            "mkdir -p {g} && mount -t virtiofs {o}{tag} {g}",
-            g = shell_quote(guest),
-            o = if ro { "-o ro " } else { "" }
-        ));
-        virtiofs.push((tag, host.to_string()));
+        let o = if ro { "-o ro " } else { "" };
+        let hp = Path::new(host);
+        if hp.is_file() {
+            // virtio-fs shares directories: share the file's directory at a hidden path
+            // and symlink the file into place.
+            let dir = hp.parent().ok_or_else(|| anyhow!("bad volume source {host}"))?;
+            let name = hp.file_name().ok_or_else(|| anyhow!("bad volume source {host}"))?.to_string_lossy();
+            let at = format!("/.agentbox/mnt/{tag}");
+            let parent = Path::new(guest).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "/".into());
+            mounts.push(format!(
+                "mkdir -p {at} {p} && mount -t virtiofs {o}{tag} {at} && rm -rf {g} && ln -s {f} {g}",
+                p = shell_quote(&parent),
+                g = shell_quote(guest),
+                f = shell_quote(&format!("{at}/{name}")),
+            ));
+            virtiofs.push((tag, dir.to_string_lossy().into_owned()));
+        } else {
+            mounts.push(format!("mkdir -p {g} && mount -t virtiofs {o}{tag} {g}", g = shell_quote(guest)));
+            virtiofs.push((tag, host.to_string()));
+        }
     }
 
     // libkrun hands argv/env to the guest on the kernel command line, which only carries
     // printable ASCII and mangles embedded quotes (tabs/newlines even panic the VMM). So
     // when the image has a shell, put the real argv/env in a launcher script and boot
     // `/bin/sh /.agentbox/entry.sh` instead. The script also starts the exec helper.
-    let (exec, args, env) = if let Some(shell) = find_shell(&rootfs) {
+    let (exec, args, env) = if let Some(shell) = find_shell(rootfs) {
         let mut s = String::from("#!/bin/sh\n# written by agentbox on each start\nset -e\n");
-        for kv in &env {
+        for kv in env {
             s.push_str(&format!("export {}\n", shell_quote(kv)));
         }
         for m in &mounts {
             s.push_str(m);
             s.push('\n');
         }
-        s.push_str(EXECD);
+        if !g.forwards.is_empty() {
+            let bin = GUEST_HELPER.ok_or_else(|| anyhow!("this agentbox build has no guest helper (run `make guest`)"))?;
+            let p = rootfs.join(".agentbox/bin/agentbox-guest");
+            fs::create_dir_all(p.parent().unwrap())?;
+            if p.exists() {
+                fs::remove_file(&p)?;
+            }
+            fs::write(&p, bin)?;
+            fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+            s.push_str("/.agentbox/bin/agentbox-guest fwd");
+            for f in &g.forwards {
+                s.push(' ');
+                s.push_str(&shell_quote(f));
+            }
+            s.push_str(" >/dev/null 2>&1 </dev/null &\n");
+        }
+        if g.execd {
+            s.push_str(EXECD);
+        }
         // init chdirs before our mounts exist, so change into the workdir here.
-        s.push_str(&format!("cd {}\nset +e\nexec", shell_quote(&workdir)));
-        for a in &argv {
+        s.push_str(&format!("mkdir -p {w} 2>/dev/null; cd {w}\nset +e\nexec", w = shell_quote(workdir)));
+        for a in argv {
             s.push(' ');
             s.push_str(&shell_quote(a));
         }
@@ -171,33 +263,29 @@ pub fn build_spec(store: &Store, c: &Container) -> Result<VmSpec> {
         let boot_env: Vec<String> = env.iter().filter(|e| e.starts_with("PATH=")).cloned().collect();
         (shell.to_string(), vec!["/.agentbox/entry.sh".to_string()], boot_env)
     } else {
+        if !g.forwards.is_empty() {
+            bail!("{} has no shell (/bin/sh), so it can't run the service-name forwarders", g.what);
+        }
         if !mounts.is_empty() {
-            bail!("volumes need a shell (/bin/sh or /busybox/sh) in the image, and {} has none", image.reference);
+            bail!("volumes need a shell (/bin/sh or /busybox/sh) in the image, and {} has none", g.what);
         }
         if let Some(bad) = argv.iter().chain(env.iter()).find(|a| !cmdline_safe(a)) {
-            bail!(
-                "{} has no /bin/sh, so arguments must be printable ASCII without double quotes; can't pass {bad:?}",
-                image.reference
-            );
+            bail!("{} has no /bin/sh, so arguments must be printable ASCII without double quotes; can't pass {bad:?}", g.what);
         }
-        (argv[0].clone(), argv[1..].to_vec(), env)
+        (argv[0].clone(), argv[1..].to_vec(), env.clone())
     };
 
-    let network = o.network.unwrap_or(true);
-    if !network && !o.ports.is_empty() {
-        bail!("port mappings need networking");
-    }
     Ok(VmSpec {
         root: rootfs.to_string_lossy().into_owned(),
         exec,
         args,
         env,
-        workdir,
-        cpus: o.cpus.unwrap_or(2),
-        memory_mib: o.memory_mib.unwrap_or(1024),
-        ports: o.ports.clone(),
+        workdir: workdir.clone(),
+        cpus: g.cpus,
+        memory_mib: g.memory_mib,
+        ports: g.ports.clone(),
         virtiofs,
-        network,
+        network: g.network,
     })
 }
 
@@ -241,7 +329,7 @@ pub fn has_shell(rootfs: &Path) -> bool {
 /// are proxied through the host (libkrun TSI), so the host's nameservers are reachable;
 /// loopback resolvers are skipped because they'd point at the guest itself. A guest
 /// connecting to 127.0.0.1 reaches the host's loopback, so host.docker.internal maps there.
-fn write_network_files(rootfs: &Path) -> Result<()> {
+fn write_network_files(rootfs: &Path, extra_hosts: &[String]) -> Result<()> {
     let etc = rootfs.join("etc");
     fs::create_dir_all(&etc)?;
     let mut servers: Vec<String> = fs::read_to_string("/etc/resolv.conf")
@@ -254,17 +342,38 @@ fn write_network_files(rootfs: &Path) -> Result<()> {
         servers = vec!["1.1.1.1".into(), "8.8.8.8".into()];
     }
     let resolv: String = servers.iter().map(|s| format!("nameserver {s}\n")).collect();
+    // Rebuilt on every start from the image's own file (saved on first start), so entries
+    // from an earlier configuration don't pile up.
     let hosts_path = etc.join("hosts");
-    let mut hosts = if fs::symlink_metadata(&hosts_path).map(|m| m.is_file()).unwrap_or(false) {
-        fs::read_to_string(&hosts_path).unwrap_or_default()
-    } else {
-        "127.0.0.1 localhost\n::1 localhost\n".to_string()
+    let orig_path = rootfs.join(".agentbox/hosts.image");
+    if !orig_path.exists() {
+        let orig = if fs::symlink_metadata(&hosts_path).map(|m| m.is_file()).unwrap_or(false) {
+            fs::read_to_string(&hosts_path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        fs::create_dir_all(rootfs.join(".agentbox"))?;
+        fs::write(&orig_path, orig)?;
+    }
+    let mut hosts = fs::read_to_string(&orig_path).unwrap_or_default();
+    if !hosts.ends_with('\n') && !hosts.is_empty() {
+        hosts.push('\n');
+    }
+    let has_name = |h: &str, name: &str| {
+        h.lines().any(|l| !l.trim_start().starts_with('#') && l.split_whitespace().skip(1).any(|n| n == name))
     };
-    if !hosts.contains("host.docker.internal") {
-        if !hosts.ends_with('\n') && !hosts.is_empty() {
-            hosts.push('\n');
-        }
+    // Images often ship an empty /etc/hosts (Docker writes one at runtime).
+    if !has_name(&hosts, "localhost") {
+        hosts.push_str("127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n");
+    }
+    if !has_name(&hosts, "host.docker.internal") {
         hosts.push_str("127.0.0.1 host.docker.internal host.agentbox.internal\n");
+    }
+    for h in extra_hosts {
+        if let Some((name, ip)) = h.split_once(':').or_else(|| h.split_once('=')) {
+            let ip = if ip == "host-gateway" { "127.0.0.1" } else { ip };
+            hosts.push_str(&format!("{ip} {name}\n"));
+        }
     }
     for (name, body) in [("resolv.conf", resolv), ("hosts", hosts)] {
         let p = etc.join(name);
@@ -327,13 +436,29 @@ pub fn vm_child() -> Result<()> {
             unsafe { libc::_exit(137) };
         }
     });
+    // virtio-fs keeps a host file descriptor per open guest file, and macOS's default
+    // soft limit (256) is far too low for e.g. Python importing a large venv.
+    unsafe {
+        let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) == 0 {
+            for want in [r.rlim_max, 1 << 20, 65536, 24576, 10240] {
+                let cur = want.min(r.rlim_max);
+                if cur <= r.rlim_cur {
+                    continue;
+                }
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &libc::rlimit { rlim_cur: cur, rlim_max: r.rlim_max }) == 0 {
+                    break;
+                }
+            }
+        }
+    }
     let spec: VmSpec = serde_json::from_str(&std::env::var(SPEC_ENV).context("missing VM spec")?)?;
     let root = cstr(&spec.root)?;
     let exec = cstr(&spec.exec)?;
     let workdir = cstr(&spec.workdir)?;
     let (_a, argv) = cvec(&spec.args)?;
     let (_e, envp) = cvec(&spec.env)?;
-    let (_p, ports) = cvec(&spec.ports)?;
+    let (_p, ports) = cvec(spec.ports.as_deref().unwrap_or(&[]))?;
     let fs: Vec<(CString, CString)> =
         spec.virtiofs.iter().map(|(t, p)| Ok((cstr(t)?, cstr(p)?))).collect::<Result<_>>()?;
 
@@ -353,7 +478,7 @@ pub fn vm_child() -> Result<()> {
             check("krun_disable_implicit_vsock", krun_disable_implicit_vsock(ctx))?;
             check("krun_add_vsock", krun_add_vsock(ctx, 0))?;
         }
-        if !spec.ports.is_empty() {
+        if spec.ports.is_some() {
             check("krun_set_port_map", krun_set_port_map(ctx, ports.as_ptr()))?;
         }
         check("krun_set_workdir", krun_set_workdir(ctx, workdir.as_ptr()))?;

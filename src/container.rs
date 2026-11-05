@@ -299,7 +299,7 @@ extern "C" fn forward_signal(sig: libc::c_int) {
 
 /// Fail like Docker ("port is already allocated") instead of letting the VMM share or
 /// silently skip a host port that is in use.
-fn check_ports(c: &Container) -> Result<()> {
+pub fn check_ports(c: &Container) -> Result<()> {
     for p in &c.config.ports {
         let host: u16 = p.split(':').next().and_then(|h| h.parse().ok()).unwrap_or(0);
         if std::net::TcpListener::bind(("0.0.0.0", host)).is_err() {

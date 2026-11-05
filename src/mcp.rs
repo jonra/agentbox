@@ -2,6 +2,7 @@
 //! Claude Code can pull images and run sandboxed commands as tools.
 
 use crate::container::{self, ExecOpts, RunResult};
+use crate::{build, compose};
 use crate::store::Store;
 use crate::{registry, vm};
 use anyhow::{anyhow, Result};
@@ -80,6 +81,36 @@ separately. Needs /bin/sh in the image.",
             "name": "remove_container",
             "description": "Delete a container and its filesystem (force stops it first if running).",
             "inputSchema": {"type": "object", "properties": {"container": {"type": "string"}}, "required": ["container"]}
+        },
+        {
+            "name": "build_image",
+            "description": "Build an image from a Dockerfile (like `docker build`): multi-stage, ARG/ENV, COPY/ADD, \
+RUN (incl. --mount=type=cache), .dockerignore, layer cache. Returns the end of the build log.",
+            "inputSchema": {"type": "object", "properties": {
+                "context": {"type": "string", "description": "Absolute path of the build context directory"},
+                "dockerfile": {"type": "string", "description": "Dockerfile path (default: <context>/Dockerfile)"},
+                "tag": {"type": "string", "description": "Image name, e.g. myapp:dev (default: <context dir name>:latest)"},
+                "build_args": {"type": "array", "items": {"type": "string"}, "description": "KEY=VALUE"},
+                "target": {"type": "string", "description": "Stage to build"},
+                "no_cache": {"type": "boolean", "default": false}
+            }, "required": ["context"]}
+        },
+        {
+            "name": "compose",
+            "description": "Run a Compose project (compose.yaml / docker-compose.yml) like `docker compose`. Actions: \
+up (build/pull as needed, start detached, wait for healthchecks), down, ps, logs, build, restart, stop. Services reach \
+each other by service name. Returns progress or output text.",
+            "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["up", "down", "ps", "logs", "build", "restart", "stop", "config"]},
+                "project_dir": {"type": "string", "description": "Absolute path of the directory holding the compose file"},
+                "files": {"type": "array", "items": {"type": "string"}, "description": "Compose files (default: compose.yaml etc. in project_dir)"},
+                "project_name": {"type": "string"},
+                "services": {"type": "array", "items": {"type": "string"}, "description": "Limit to these services"},
+                "profiles": {"type": "array", "items": {"type": "string"}},
+                "build": {"type": "boolean", "description": "up: rebuild images first"},
+                "volumes": {"type": "boolean", "description": "down: also remove named volumes"},
+                "tail": {"type": "integer", "description": "logs: last N lines per service (default 200)"}
+            }, "required": ["action", "project_dir"]}
         },
         {
             "name": "pull_image",
@@ -191,6 +222,43 @@ fn call_tool(store: &Store, name: &str, args: &Value) -> Result<(String, bool)> 
             container::remove(store, &c, true)?;
             Ok((format!("removed {}", c.name), false))
         }
+        "build_image" => {
+            let mut log = vec![];
+            let opts = build::BuildOpts {
+                context: str_arg(args, "context")?.into(),
+                dockerfile: args.get("dockerfile").and_then(|v| v.as_str()).map(Into::into),
+                tags: args.get("tag").and_then(|v| v.as_str()).map(|t| vec![t.to_string()]).unwrap_or_default(),
+                build_args: strings(args, "build_args"),
+                target: args.get("target").and_then(|v| v.as_str()).map(String::from),
+                no_cache: args.get("no_cache").and_then(|v| v.as_bool()).unwrap_or(false),
+                pull: false,
+                cpus: std::thread::available_parallelism().map(|n| n.get().min(8) as u8).unwrap_or(4),
+                memory_mib: 4096,
+            };
+            let r = build::build(store, &opts, &mut log);
+            let text = tail_text(&String::from_utf8_lossy(&log), 150);
+            match r {
+                Ok(m) => Ok((format!("built {}\n{text}", m.reference), false)),
+                Err(e) => Ok((format!("build failed: {e:#}\n--- log ---\n{text}"), true)),
+            }
+        }
+        "compose" => {
+            let action = str_arg(args, "action")?;
+            let opts = compose::ComposeOpts {
+                files: strings(args, "files").into_iter().map(Into::into).collect(),
+                project_name: args.get("project_name").and_then(|v| v.as_str()).map(String::from),
+                project_dir: Some(str_arg(args, "project_dir")?.into()),
+                env_files: vec![],
+                profiles: strings(args, "profiles"),
+            };
+            if !opts.files.is_empty() {
+                // Relative compose file names are relative to the project directory.
+                let dir = std::path::PathBuf::from(str_arg(args, "project_dir")?);
+                let files = opts.files.iter().map(|f| if f.is_absolute() { f.clone() } else { dir.join(f) }).collect();
+                return compose_tool(store, compose::ComposeOpts { files, ..opts }, action, args);
+            }
+            compose_tool(store, opts, action, args)
+        }
         "pull_image" => {
             let m = registry::pull(store, str_arg(args, "image")?, true)?;
             Ok((serde_json::to_string_pretty(&m)?, false))
@@ -202,6 +270,90 @@ fn call_tool(store: &Store, name: &str, args: &Value) -> Result<(String, bool)> 
             Ok(("removed".into(), false))
         }
         other => Err(anyhow!("unknown tool {other}")),
+    }
+}
+
+fn tail_text(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    let mut t = lines[start..].join("\n");
+    if start > 0 {
+        t = format!("[... {start} earlier lines ...]\n{t}");
+    }
+    t
+}
+
+fn compose_tool(store: &Store, opts: compose::ComposeOpts, action: &str, args: &Value) -> Result<(String, bool)> {
+    let p = compose::load(store, &opts)?;
+    let services = strings(args, "services");
+    let mut out = vec![];
+    let result: Result<()> = (|| {
+        match action {
+            "up" => {
+                let o = compose::UpOpts {
+                    detach: true,
+                    build: args.get("build").and_then(|v| v.as_bool()).unwrap_or(false),
+                    no_build: false,
+                    force_recreate: false,
+                    no_recreate: false,
+                    no_deps: false,
+                    remove_orphans: false,
+                    wait: true,
+                    services: services.clone(),
+                    pull: None,
+                };
+                compose::up(store, &p, &o, &mut out)?;
+            }
+            "down" => compose::down(store, &p, args.get("volumes").and_then(|v| v.as_bool()).unwrap_or(false), None, false, &mut out)?,
+            "build" => {
+                let svcs = if services.is_empty() { p.services.iter().collect() } else { p.selection(&services, false)? };
+                compose::build_images(store, &p, &svcs, true, false, false, &mut out)?;
+            }
+            "stop" | "restart" => {
+                let mut cs = p.containers(store)?;
+                if !services.is_empty() {
+                    cs.retain(|c| c.config.labels.get(compose::L_SERVICE).map(|s| services.contains(s)).unwrap_or(false));
+                }
+                for c in &cs {
+                    container::stop(store, c, Duration::from_secs(10))?;
+                    if action == "restart" {
+                        container::start_detached(store, c)?;
+                    }
+                    writeln!(out, "{} {}", if action == "restart" { "restarted" } else { "stopped" }, c.name)?;
+                }
+            }
+            "ps" => {
+                for (c, svc) in compose::ps_rows(store, &p, true, &services)? {
+                    let st = c.state(store);
+                    writeln!(
+                        out,
+                        "{svc}: {} {}{} {}",
+                        c.name,
+                        st.status,
+                        st.exit_code.filter(|_| !st.running()).map(|x| format!(" ({x})")).unwrap_or_default(),
+                        compose::ports_text(&c)
+                    )?;
+                }
+            }
+            "logs" => {
+                let tail = args.get("tail").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+                for (c, svc) in compose::ps_rows(store, &p, true, &services)? {
+                    let mut buf = vec![];
+                    container::logs(store, &c, false, Some(tail), &mut buf)?;
+                    for l in String::from_utf8_lossy(&buf).lines() {
+                        writeln!(out, "{svc} | {l}")?;
+                    }
+                }
+            }
+            "config" => writeln!(out, "{}", serde_yaml::to_string(&compose::config_json(store, &p)?)?)?,
+            other => anyhow::bail!("unknown compose action {other}"),
+        }
+        Ok(())
+    })();
+    let text = tail_text(&String::from_utf8_lossy(&out), 400);
+    match result {
+        Ok(()) => Ok((if text.is_empty() { "ok".into() } else { text }, false)),
+        Err(e) => Ok((format!("{text}\nerror: {e:#}"), true)),
     }
 }
 

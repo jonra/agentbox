@@ -28,6 +28,11 @@ pub struct Reference {
 impl Reference {
     pub fn parse(s: &str) -> Result<Reference> {
         let (rest, tag) = if let Some((r, d)) = s.split_once('@') {
+            // name:tag@sha256:... -- the digest wins, the tag is informational
+            let r = match r.rfind(':') {
+                Some(i) if !r[i..].contains('/') => &r[..i],
+                _ => r,
+            };
             (r.to_string(), d.to_string())
         } else {
             // a ':' after the last '/' is a tag, otherwise it's a registry port
@@ -276,7 +281,7 @@ pub fn load(store: &Store, archive: &str, tag: Option<&str>) -> Result<Vec<Image
 
 /// Build an image's rootfs from its layer files and record its metadata. Extracts into a
 /// staging dir and swaps it in, so a failure never leaves a half-built image behind.
-fn install(store: &Store, canonical: &str, digest: String, config: &Value, layers: &[(PathBuf, String)]) -> Result<ImageMeta> {
+pub fn install(store: &Store, canonical: &str, digest: String, config: &Value, layers: &[(PathBuf, String)]) -> Result<ImageMeta> {
     let image_dir = store.image_dir(canonical);
     let staging = image_dir.with_extension("staging");
     if staging.exists() {
@@ -303,6 +308,8 @@ fn install(store: &Store, canonical: &str, digest: String, config: &Value, layer
         workdir: cfg["WorkingDir"].as_str().unwrap_or_default().to_string(),
         user: cfg["User"].as_str().unwrap_or_default().to_string(),
         size_bytes: size,
+        exposed_ports: cfg["ExposedPorts"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default(),
+        healthcheck: cfg.get("Healthcheck").filter(|h| h.is_object()).cloned(),
     };
     fs::write(staging.join("image.json"), serde_json::to_vec_pretty(&meta)?)?;
     if image_dir.exists() {
@@ -408,6 +415,8 @@ mod tests {
         assert_eq!(r("ghcr.io/org/app"), ("ghcr.io".into(), "org/app".into(), "latest".into()));
         assert_eq!(r("localhost:5000/app:dev"), ("localhost:5000".into(), "app".into(), "dev".into()));
         assert_eq!(r("alpine@sha256:abc"), ("docker.io".into(), "library/alpine".into(), "sha256:abc".into()));
+        assert_eq!(r("maven:3.9@sha256:abc"), ("docker.io".into(), "library/maven".into(), "sha256:abc".into()));
+        assert_eq!(r("localhost:5000/app:1@sha256:abc"), ("localhost:5000".into(), "app".into(), "sha256:abc".into()));
         assert_eq!(Reference::parse("library/alpine:3").unwrap().canonical(), "alpine:3");
         assert_eq!(Reference::parse("ghcr.io/o/a").unwrap().canonical(), "ghcr.io/o/a:latest");
     }

@@ -1,3 +1,5 @@
+mod build;
+mod compose;
 mod container;
 mod mcp;
 mod registry;
@@ -56,6 +58,9 @@ struct CreateArgs {
     /// Same as --network none
     #[arg(long, hide = true)]
     no_network: bool,
+    /// Add a custom host-to-IP mapping (host:ip)
+    #[arg(long = "add-host")]
+    add_host: Vec<String>,
     /// Automatically remove the container when it exits
     #[arg(long)]
     rm: bool,
@@ -200,6 +205,52 @@ enum Cmd {
         #[arg(long)]
         tag: Option<String>,
     },
+    /// Build an image from a Dockerfile
+    Build {
+        /// Name and optionally a tag (name:tag); repeatable
+        #[arg(short = 't', long = "tag")]
+        tag: Vec<String>,
+        /// Name of the Dockerfile (default: PATH/Dockerfile)
+        #[arg(short = 'f', long = "file")]
+        file: Option<String>,
+        /// Set build-time variables (KEY=VALUE, or KEY to copy from the environment)
+        #[arg(long = "build-arg")]
+        build_arg: Vec<String>,
+        /// Set the target build stage to build
+        #[arg(long)]
+        target: Option<String>,
+        /// Do not use the build cache
+        #[arg(long)]
+        no_cache: bool,
+        /// Always pull newer versions of base images
+        #[arg(long)]
+        pull: bool,
+        /// Only print the image reference at the end
+        #[arg(short = 'q', long)]
+        quiet: bool,
+        /// CPUs for RUN steps (default: up to 8)
+        #[arg(long)]
+        cpus: Option<f32>,
+        /// Memory for RUN steps (default 4g)
+        #[arg(short = 'm', long)]
+        memory: Option<String>,
+        /// Accepted for Docker compatibility (always linux/<host arch>)
+        #[arg(long)]
+        platform: Option<String>,
+        /// Accepted for Docker compatibility
+        #[arg(long, hide = true)]
+        progress: Option<String>,
+        /// Build context directory
+        #[arg(default_value = ".")]
+        path: String,
+    },
+    /// Manage the build cache
+    Builder {
+        #[command(subcommand)]
+        cmd: BuilderCmd,
+    },
+    /// Define and run multi-container applications (compose.yaml)
+    Compose(ComposeArgs),
     /// Create a tag TARGET_IMAGE that refers to SOURCE_IMAGE
     Tag { source: String, target: String },
     /// Manage named volumes
@@ -222,6 +273,194 @@ enum Cmd {
     Vm,
     #[command(name = "__supervise", hide = true)]
     Supervise { id: String },
+}
+
+#[derive(Subcommand)]
+enum BuilderCmd {
+    /// Remove the build cache
+    Prune {
+        /// Also remove RUN --mount=type=cache directories
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Accepted for Docker compatibility (never prompts)
+        #[arg(short = 'f', long)]
+        force: bool,
+    },
+}
+
+#[derive(Args)]
+struct ComposeArgs {
+    /// Compose configuration files
+    #[arg(short = 'f', long = "file", global = true)]
+    file: Vec<String>,
+    /// Project name
+    #[arg(short = 'p', long = "project-name", global = true)]
+    project_name: Option<String>,
+    /// Alternate working directory
+    #[arg(long = "project-directory", global = true)]
+    project_directory: Option<String>,
+    /// Alternate environment files
+    #[arg(long = "env-file", global = true)]
+    env_file: Vec<String>,
+    /// Enable a profile
+    #[arg(long = "profile", global = true)]
+    profile: Vec<String>,
+    #[command(subcommand)]
+    cmd: ComposeCmd,
+}
+
+#[derive(Subcommand)]
+enum ComposeCmd {
+    /// Create and start containers
+    Up {
+        /// Run in the background
+        #[arg(short = 'd', long)]
+        detach: bool,
+        /// Build images before starting containers
+        #[arg(long)]
+        build: bool,
+        /// Don't build images, even if missing
+        #[arg(long)]
+        no_build: bool,
+        /// Recreate containers even if their configuration hasn't changed
+        #[arg(long)]
+        force_recreate: bool,
+        /// Don't recreate containers that exist
+        #[arg(long)]
+        no_recreate: bool,
+        /// Don't start linked services
+        #[arg(long)]
+        no_deps: bool,
+        /// Remove containers for services not defined in the compose file
+        #[arg(long)]
+        remove_orphans: bool,
+        /// Wait for services to be running and healthy (implies -d)
+        #[arg(long)]
+        wait: bool,
+        /// Pull image before running ("always", "missing", "never")
+        #[arg(long)]
+        pull: Option<String>,
+        services: Vec<String>,
+    },
+    /// Stop and remove containers
+    Down {
+        /// Remove named volumes declared in the compose file
+        #[arg(short = 'v', long)]
+        volumes: bool,
+        /// Remove images used by services: "local" (built ones) or "all"
+        #[arg(long)]
+        rmi: Option<String>,
+        /// Remove containers for services not defined in the compose file
+        #[arg(long)]
+        remove_orphans: bool,
+    },
+    /// List containers
+    Ps {
+        #[arg(short = 'a', long)]
+        all: bool,
+        #[arg(short = 'q', long)]
+        quiet: bool,
+        services: Vec<String>,
+    },
+    /// View output from containers
+    Logs {
+        #[arg(short = 'f', long)]
+        follow: bool,
+        #[arg(short = 'n', long, default_value = "all")]
+        tail: String,
+        services: Vec<String>,
+    },
+    /// Build or rebuild services
+    Build {
+        #[arg(long)]
+        no_cache: bool,
+        #[arg(long)]
+        pull: bool,
+        services: Vec<String>,
+    },
+    /// Pull service images
+    Pull { services: Vec<String> },
+    /// Start existing containers
+    Start { services: Vec<String> },
+    /// Stop running containers
+    Stop {
+        #[arg(short = 't', long = "timeout")]
+        timeout: Option<u64>,
+        services: Vec<String>,
+    },
+    /// Restart containers
+    Restart {
+        #[arg(short = 't', long = "timeout")]
+        timeout: Option<u64>,
+        services: Vec<String>,
+    },
+    /// Execute a command in a running service container
+    Exec {
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
+        #[arg(short = 'w', long = "workdir")]
+        workdir: Option<String>,
+        /// Accepted for compatibility (no TTY)
+        #[arg(short = 'T', long = "no-TTY")]
+        no_tty: bool,
+        /// Accepted for compatibility
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        service: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Run a one-off command on a service
+    Run {
+        #[arg(long)]
+        rm: bool,
+        #[arg(short = 'd', long)]
+        detach: bool,
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
+        #[arg(short = 'w', long = "workdir")]
+        workdir: Option<String>,
+        #[arg(long)]
+        entrypoint: Option<String>,
+        #[arg(long)]
+        no_deps: bool,
+        /// Publish the service's ports
+        #[arg(long)]
+        service_ports: bool,
+        /// Accepted for compatibility (no TTY)
+        #[arg(short = 'T', long = "no-TTY")]
+        no_tty: bool,
+        /// Accepted for compatibility
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        service: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Remove stopped service containers
+    Rm {
+        #[arg(short = 'f', long)]
+        force: bool,
+        #[arg(short = 's', long)]
+        stop: bool,
+        services: Vec<String>,
+    },
+    /// Print the resolved configuration
+    Config {
+        /// Only print service names
+        #[arg(long)]
+        services: bool,
+        /// Print JSON instead of YAML
+        #[arg(long)]
+        json: bool,
+    },
+    /// List running compose projects
+    Ls {
+        #[arg(short = 'a', long)]
+        all: bool,
+    },
+    /// List images used by the services
+    Images,
 }
 
 #[derive(Subcommand)]
@@ -264,7 +503,7 @@ fn main() {
     }
 }
 
-fn parse_memory(s: &str) -> Result<u32> {
+pub(crate) fn parse_memory(s: &str) -> Result<u32> {
     let t = s.trim().to_ascii_lowercase();
     let t = t.strip_suffix('b').filter(|x| x.ends_with(['k', 'm', 'g'])).unwrap_or(&t);
     let (num, mult) = match t.chars().last() {
@@ -315,6 +554,8 @@ fn to_opts(a: &CreateArgs) -> Result<vm::RunOpts> {
         name: a.name.clone(),
         network,
         rm: a.rm,
+        extra_hosts: a.add_host.clone(),
+        ..Default::default()
     })
 }
 
@@ -391,12 +632,7 @@ fn ps(store: &Store, all: bool, quiet: bool) -> Result<()> {
     }
     let mut rows = vec![["CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "PORTS", "NAMES"].map(String::from).to_vec()];
     for c in cs {
-        let ports: Vec<String> = c
-            .config
-            .ports
-            .iter()
-            .filter_map(|p| p.split_once(':').map(|(h, g)| format!("0.0.0.0:{h}->{g}/tcp")))
-            .collect();
+        let ports = vec![compose::ports_text(&c)];
         rows.push(vec![
             c.short_id().to_string(),
             c.image.clone(),
@@ -586,6 +822,32 @@ fn real_main() -> Result<i32> {
                 println!("Loaded image: {}", m.reference);
             }
         }
+        Cmd::Build { tag, file, build_arg, target, no_cache, pull, quiet, cpus, memory, path, .. } => {
+            let opts = build::BuildOpts {
+                context: path.into(),
+                dockerfile: file.map(Into::into),
+                tags: tag,
+                build_args: build_arg,
+                target,
+                no_cache,
+                pull,
+                cpus: cpus.map(|c| c.ceil().clamp(1.0, 64.0) as u8).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get().min(8) as u8).unwrap_or(4)),
+                memory_mib: memory.as_deref().map(parse_memory).transpose()?.unwrap_or(4096),
+            };
+            let meta = if quiet {
+                build::build(&store, &opts, &mut std::io::sink())?
+            } else {
+                build::build(&store, &opts, &mut std::io::stderr())?
+            };
+            if quiet {
+                println!("{}", meta.reference);
+            }
+        }
+        Cmd::Builder { cmd: BuilderCmd::Prune { all, .. } } => {
+            let n = build::prune_cache(&store, all)?;
+            println!("Removed {n} cache entries");
+        }
+        Cmd::Compose(args) => return compose_cmd(&store, args),
         Cmd::Tag { source, target } => {
             let src = registry::Reference::parse(&source)?.canonical();
             let dst = registry::Reference::parse(&target)?.canonical();
@@ -643,6 +905,173 @@ fn real_main() -> Result<i32> {
         Cmd::Mcp => mcp::serve(store)?,
         Cmd::Supervise { id } => container::supervise(&store, &id)?,
         Cmd::Vm => unreachable!(),
+    }
+    Ok(0)
+}
+
+fn compose_cmd(store: &Store, a: ComposeArgs) -> Result<i32> {
+    let opts = compose::ComposeOpts {
+        files: a.file.iter().map(Into::into).collect(),
+        project_name: a.project_name.clone(),
+        project_dir: a.project_directory.as_ref().map(Into::into),
+        env_files: a.env_file.iter().map(Into::into).collect(),
+        profiles: a.profile.clone(),
+    };
+    let p = compose::load(store, &opts)?;
+    let pick = |services: &[String]| -> Result<Vec<Container>> {
+        let mut cs = p.containers(store)?;
+        cs.retain(|c| !c.config.labels.contains_key(compose::L_ONEOFF));
+        if !services.is_empty() {
+            for s in services {
+                p.service(s)?;
+            }
+            cs.retain(|c| c.config.labels.get(compose::L_SERVICE).map(|s| services.contains(s)).unwrap_or(false));
+        }
+        let order: Vec<&str> = p.services.iter().map(|s| s.name.as_str()).collect();
+        cs.sort_by_key(|c| order.iter().position(|n| Some(&n.to_string()) == c.config.labels.get(compose::L_SERVICE)).unwrap_or(usize::MAX));
+        Ok(cs)
+    };
+    let timeout_of = |c: &Container, t: Option<u64>| -> Duration {
+        t.map(Duration::from_secs).unwrap_or_else(|| {
+            c.config.labels.get(compose::L_SERVICE).and_then(|n| p.service(n).ok()).map(|s| s.stop_timeout).unwrap_or(Duration::from_secs(10))
+        })
+    };
+    match a.cmd {
+        ComposeCmd::Up { detach, build, no_build, force_recreate, no_recreate, no_deps, remove_orphans, wait, pull, services } => {
+            return compose::up(
+                store,
+                &p,
+                &compose::UpOpts { detach: detach || wait, build, no_build, force_recreate, no_recreate, no_deps, remove_orphans, wait, services, pull },
+                &mut std::io::stderr(),
+            );
+        }
+        ComposeCmd::Down { volumes, rmi, remove_orphans } => compose::down(store, &p, volumes, rmi.as_deref(), remove_orphans, &mut std::io::stderr())?,
+        ComposeCmd::Ps { all, quiet, services } => {
+            let rows = compose::ps_rows(store, &p, all, &services)?;
+            if quiet {
+                for (c, _) in rows {
+                    println!("{}", c.short_id());
+                }
+            } else {
+                let mut t = vec![["NAME", "IMAGE", "SERVICE", "CREATED", "STATUS", "PORTS"].map(String::from).to_vec()];
+                for (c, svc) in rows {
+                    t.push(vec![c.name.clone(), c.image.clone(), svc, format!("{} ago", ago(c.created)), status_text(store, &c), compose::ports_text(&c)]);
+                }
+                print_table(t);
+            }
+        }
+        ComposeCmd::Logs { follow, tail, services } => {
+            let tail = if tail == "all" { None } else { Some(tail.parse().context("--tail must be a number or \"all\"")?) };
+            compose::multiplex_logs(store, &pick(&services)?, follow, tail, None)?;
+        }
+        ComposeCmd::Build { no_cache, pull, services } => {
+            let svcs = p.selection(&services, false)?;
+            let svcs: Vec<&compose::Service> = if services.is_empty() { p.services.iter().collect() } else { svcs };
+            compose::build_images(store, &p, &svcs, true, no_cache, pull, &mut std::io::stderr())?;
+        }
+        ComposeCmd::Pull { services } => {
+            for s in p.selection(&services, false)? {
+                if s.build.is_some() && !s.explicit_image {
+                    continue;
+                }
+                eprintln!(" Pulling {} ({})", s.name, s.image);
+                if let Err(e) = registry::pull(store, &s.image, true) {
+                    if s.build.is_none() {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        ComposeCmd::Start { services } => {
+            for c in pick(&services)? {
+                if !c.state(store).running() {
+                    container::start_detached(store, &c)?;
+                    eprintln!(" Container {:<28} Started", c.name);
+                }
+            }
+        }
+        ComposeCmd::Stop { timeout, services } => {
+            for c in pick(&services)?.into_iter().rev() {
+                container::stop(store, &c, timeout_of(&c, timeout))?;
+                eprintln!(" Container {:<28} Stopped", c.name);
+            }
+        }
+        ComposeCmd::Restart { timeout, services } => {
+            let cs = pick(&services)?;
+            for c in cs.iter().rev() {
+                container::stop(store, c, timeout_of(c, timeout))?;
+            }
+            for c in &cs {
+                container::start_detached(store, c)?;
+                eprintln!(" Container {:<28} Restarted", c.name);
+            }
+        }
+        ComposeCmd::Exec { env, workdir, service, command, .. } => {
+            let s = p.service(&service)?;
+            let c = container::find(store, &s.container_name).map_err(|_| anyhow!("service {service} is not running"))?;
+            let o = ExecOpts { command, env, workdir, timeout: None };
+            let code = container::exec(store, &c, &o, &mut |is_err, b| {
+                if is_err {
+                    let _ = std::io::stderr().write_all(b);
+                } else {
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(b);
+                    let _ = out.flush();
+                }
+            })?;
+            return Ok(code.unwrap_or(124));
+        }
+        ComposeCmd::Run { rm, detach, env, workdir, entrypoint, no_deps, service_ports, service, command, .. } => {
+            let ep = entrypoint.map(|e| build::shell_split(&e)).transpose()?;
+            return compose::run(store, &p, &service, command, env, rm, no_deps, service_ports, ep, workdir, detach);
+        }
+        ComposeCmd::Rm { force, stop, services } => {
+            for c in pick(&services)? {
+                if c.state(store).running() {
+                    if !stop && !force {
+                        eprintln!(" Container {:<28} is running (use -s to stop it first)", c.name);
+                        continue;
+                    }
+                    container::stop(store, &c, timeout_of(&c, None))?;
+                }
+                container::remove(store, &c, true)?;
+                eprintln!(" Container {:<28} Removed", c.name);
+            }
+        }
+        ComposeCmd::Config { services, json } => {
+            if services {
+                for s in &p.services {
+                    println!("{}", s.name);
+                }
+            } else {
+                let v = compose::config_json(store, &p)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                } else {
+                    print!("{}", serde_yaml::to_string(&v)?);
+                }
+            }
+        }
+        ComposeCmd::Ls { all } => {
+            let mut t = vec![vec!["NAME".to_string(), "STATUS".into(), "CONFIG DIR".into()]];
+            for (n, running, total, dir) in compose::projects(store)? {
+                if running == 0 && !all {
+                    continue;
+                }
+                t.push(vec![n, format!("running({running}) of {total}"), dir]);
+            }
+            print_table(t);
+        }
+        ComposeCmd::Images => {
+            let mut t = vec![vec!["SERVICE".to_string(), "IMAGE".into(), "IMAGE ID".into(), "SIZE".into()]];
+            for s in &p.services {
+                let r = registry::Reference::parse(&s.image)?.canonical();
+                if let Some(m) = store.image(&r)? {
+                    t.push(vec![s.name.clone(), r, m.digest.get(7..19).unwrap_or("").to_string(), format!("{:.1}MB", m.size_bytes as f64 / 1e6)]);
+                }
+            }
+            print_table(t);
+        }
     }
     Ok(0)
 }
