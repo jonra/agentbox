@@ -385,9 +385,29 @@ fn write_network_files(rootfs: &Path, extra_hosts: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// libkrun loads libkrunfw (the guest kernel) with a bare dlopen. A copy in `~/.agentbox/lib`
+/// (`make krunfw` builds jonra/libkrunfw, which fixes servers that bind port 0) wins over
+/// Homebrew's: the `__vm` child gets that directory first in the loader path.
+const KRUNFW_FILE: &str = if cfg!(target_os = "macos") { "libkrunfw.5.dylib" } else { "libkrunfw.so.5" };
+const LOADER_PATH_ENV: &str = if cfg!(target_os = "macos") { "DYLD_LIBRARY_PATH" } else { "LD_LIBRARY_PATH" };
+
+/// The `~/.agentbox/lib` copy of libkrunfw, if there is one.
+pub fn krunfw_override() -> Option<std::path::PathBuf> {
+    let file = crate::store::home_dir().ok()?.join("lib").join(KRUNFW_FILE);
+    file.is_file().then_some(file)
+}
+
 pub fn command(spec: &VmSpec) -> Result<Command> {
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("__vm").env(SPEC_ENV, serde_json::to_string(spec)?);
+    if let Some(file) = krunfw_override() {
+        let mut path = file.parent().unwrap_or(Path::new(".")).as_os_str().to_owned();
+        if let Some(old) = std::env::var_os(LOADER_PATH_ENV) {
+            path.push(":");
+            path.push(old);
+        }
+        cmd.env(LOADER_PATH_ENV, path);
+    }
     Ok(cmd)
 }
 

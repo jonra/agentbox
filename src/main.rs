@@ -897,6 +897,10 @@ fn real_main() -> Result<i32> {
         },
         Cmd::Version => {
             println!("agentbox {}\nruntime: libkrun microVMs ({}/{})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
+            match vm::krunfw_override() {
+                Some(f) => println!("guest kernel: {}", f.display()),
+                None => println!("guest kernel: system libkrunfw (servers that bind port 0 are unreachable; see `make krunfw`)"),
+            }
         }
         Cmd::Info => {
             let cs = container::list(&store)?;

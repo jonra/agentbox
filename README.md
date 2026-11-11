@@ -21,12 +21,21 @@ signed `agentbox-macos-arm64.tar.gz`, built by GitHub Actions:
 
 ```bash
 curl -fsSL https://github.com/jonra/agentbox/releases/latest/download/agentbox-macos-arm64.tar.gz | tar xz
-mkdir -p ~/.local/bin && mv agentbox/agentbox ~/.local/bin/
+mkdir -p ~/.local/bin ~/.agentbox/lib && mv agentbox/agentbox ~/.local/bin/
+mv agentbox/lib/libkrunfw.5.dylib ~/.agentbox/lib/
 agentbox version
 ```
 
 If you downloaded the archive in a browser, clear the quarantine flag first:
-`xattr -d com.apple.quarantine ~/.local/bin/agentbox`.
+`xattr -d com.apple.quarantine ~/.local/bin/agentbox ~/.agentbox/lib/libkrunfw.5.dylib`.
+
+**Guest kernel:** the release ships `libkrunfw.5.dylib` built from
+[jonra/libkrunfw](https://github.com/jonra/libkrunfw) (stock 5.6.2 plus one fix). With the
+stock kernel, a server that binds port 0 (a JDK `HttpServer`, Spring Boot's random test port)
+gets one port in the guest and another on the host, so connecting to it fails with "No data
+available". agentbox uses `~/.agentbox/lib/libkrunfw.5.dylib` when it exists and Homebrew's
+otherwise; `agentbox version` says which. From source, `make krunfw` builds it (in a
+container, about 15 minutes).
 
 **From source** (needs Rust; Linux with KVM works too, with libkrun built from source):
 

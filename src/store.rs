@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! ~/.agentbox/
+//!   lib/libkrunfw.5.dylib   optional patched guest kernel, used instead of Homebrew's (vm.rs)
 //!   store.sparsebundle      (macOS only) case-sensitive APFS image holding `data/`
 //!   data/                   mount point (or a plain dir on Linux / AGENTBOX_NO_VOLUME=1)
 //!     blobs/sha256/<hex>    cached layer/config blobs
@@ -48,12 +49,17 @@ pub struct ImageMeta {
     pub healthcheck: Option<serde_json::Value>,
 }
 
+/// `~/.agentbox`, or `$AGENTBOX_HOME`.
+pub fn home_dir() -> Result<PathBuf> {
+    Ok(match std::env::var_os("AGENTBOX_HOME") {
+        Some(h) => PathBuf::from(h),
+        None => PathBuf::from(std::env::var_os("HOME").context("HOME not set")?).join(".agentbox"),
+    })
+}
+
 impl Store {
     pub fn open() -> Result<Store> {
-        let home = match std::env::var_os("AGENTBOX_HOME") {
-            Some(h) => PathBuf::from(h),
-            None => PathBuf::from(std::env::var_os("HOME").context("HOME not set")?).join(".agentbox"),
-        };
+        let home = home_dir()?;
         fs::create_dir_all(&home)?;
         let data = home.join("data");
         let marker = data.join(".agentbox-store");

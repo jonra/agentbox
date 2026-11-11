@@ -27,8 +27,26 @@ jobs:
           path: guest/bin/agentbox-guest-aarch64
           if-no-files-found: error
 
+  # The guest kernel from jonra/libkrunfw (stock 5.6.2 plus the port-0 listen fix), at the
+  # repo and ref the Makefile pins. Shipped as lib/libkrunfw.5.dylib in the release.
+  krunfw:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the kernel bundle
+        run: |
+          repo=$(sed -n 's/^KRUNFW_REPO ?= //p' Makefile)
+          ref=$(sed -n 's/^KRUNFW_REF ?= //p' Makefile)
+          sudo sh scripts/krunfw-kernel.sh "$repo" "$ref" krunfw
+          gzip -9 krunfw/kernel.c
+      - uses: actions/upload-artifact@v4
+        with:
+          name: krunfw-kernel
+          path: krunfw/kernel.c.gz
+          if-no-files-found: error
+
   macos:
-    needs: guest
+    needs: [guest, krunfw]
     runs-on: macos-15 # Apple Silicon
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +54,10 @@ jobs:
         with:
           name: agentbox-guest-aarch64
           path: guest/bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: krunfw-kernel
+          path: target/krunfw
       - uses: dtolnay/rust-toolchain@stable
       - name: Install libkrun
         run: |
@@ -56,8 +78,11 @@ jobs:
           target/release/agentbox --help >/dev/null
       - name: Package
         run: |
-          mkdir -p dist/agentbox
+          mkdir -p dist/agentbox/lib
           cp target/release/agentbox README.md LICENSE dist/agentbox/
+          gunzip target/krunfw/kernel.c.gz
+          cc -fPIC -DABI_VERSION=5 -shared -install_name @rpath/libkrunfw.5.dylib \
+            -o dist/agentbox/lib/libkrunfw.5.dylib target/krunfw/kernel.c
           tar -C dist -czf dist/agentbox-macos-arm64.tar.gz agentbox
           (cd dist && shasum -a 256 agentbox-macos-arm64.tar.gz > agentbox-macos-arm64.tar.gz.sha256)
       - uses: actions/upload-artifact@v4
@@ -98,12 +123,13 @@ jobs:
 
           ```bash
           curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/agentbox-macos-arm64.tar.gz | tar xz
-          mkdir -p ~/.local/bin && mv agentbox/agentbox ~/.local/bin/
+          mkdir -p ~/.local/bin ~/.agentbox/lib && mv agentbox/agentbox ~/.local/bin/
+          mv agentbox/lib/libkrunfw.5.dylib ~/.agentbox/lib/
           agentbox version
           ```
 
           If you downloaded the archive in a browser, clear the quarantine flag first:
-          `xattr -d com.apple.quarantine ~/.local/bin/agentbox`.
+          `xattr -d com.apple.quarantine ~/.local/bin/agentbox ~/.agentbox/lib/libkrunfw.5.dylib`.
           EOF
           gh release create "${{ github.ref_name }}" dist/agentbox-macos-arm64.tar.gz dist/agentbox-macos-arm64.tar.gz.sha256 \
             --repo "${{ github.repository }}" --title "agentbox ${{ github.ref_name }}" --notes-file notes.md
