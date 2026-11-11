@@ -1,0 +1,109 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # The static Linux helper that agentbox injects into guests (compose name forwarding).
+  # Built from source here, the same way `make guest` does locally.
+  guest:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build agentbox-guest (static musl, aarch64)
+        run: CONTAINER_CLI=docker make guest
+      - name: Check it is static
+        run: file guest/bin/agentbox-guest-aarch64 | tee /dev/stderr | grep -Eq "statically linked|static-pie linked"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentbox-guest-aarch64
+          path: guest/bin/agentbox-guest-aarch64
+          if-no-files-found: error
+
+  macos:
+    needs: guest
+    runs-on: macos-15 # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: agentbox-guest-aarch64
+          path: guest/bin
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install libkrun
+        run: |
+          brew tap slp/krun
+          # Newer Homebrew asks to trust third-party formulae first; older versions lack the command.
+          brew trust --formula slp/krun/libkrun slp/krun/virglrenderer-krun 2>/dev/null || true
+          brew install slp/krun/libkrun
+      - name: Unit tests
+        run: cargo test --release
+      # GitHub's macOS runners can't run VMs (no nested virtualization), so this only
+      # checks that the binary is signed with the hypervisor entitlement and starts.
+      - name: Build and sign
+        run: make build
+      - name: Smoke test
+        run: |
+          codesign -d --entitlements - target/release/agentbox 2>&1 | grep -q com.apple.security.hypervisor
+          target/release/agentbox version
+          target/release/agentbox --help >/dev/null
+      - name: Package
+        run: |
+          mkdir -p dist/agentbox
+          cp target/release/agentbox README.md LICENSE dist/agentbox/
+          tar -C dist -czf dist/agentbox-macos-arm64.tar.gz agentbox
+          (cd dist && shasum -a 256 agentbox-macos-arm64.tar.gz > agentbox-macos-arm64.tar.gz.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentbox-macos-arm64
+          path: |
+            dist/agentbox-macos-arm64.tar.gz
+            dist/agentbox-macos-arm64.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: agentbox-macos-arm64
+          path: dist
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          ## Install (Apple Silicon macOS)
+
+          agentbox needs libkrun from Homebrew:
+
+          ```bash
+          brew tap slp/krun
+          brew trust --formula slp/krun/libkrun slp/krun/virglrenderer-krun   # newer Homebrew only
+          brew install slp/krun/libkrun
+          ```
+
+          Then download and install the binary:
+
+          ```bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/agentbox-macos-arm64.tar.gz | tar xz
+          mkdir -p ~/.local/bin && mv agentbox/agentbox ~/.local/bin/
+          agentbox version
+          ```
+
+          If you downloaded the archive in a browser, clear the quarantine flag first:
+          `xattr -d com.apple.quarantine ~/.local/bin/agentbox`.
+          EOF
+          gh release create "${{ github.ref_name }}" dist/agentbox-macos-arm64.tar.gz dist/agentbox-macos-arm64.tar.gz.sha256 \
+            --repo "${{ github.repository }}" --title "agentbox ${{ github.ref_name }}" --notes-file notes.md

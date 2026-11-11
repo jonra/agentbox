@@ -4,6 +4,7 @@ mod container;
 mod mcp;
 mod registry;
 mod store;
+mod tui;
 mod vm;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -269,6 +270,9 @@ enum Cmd {
     Info,
     /// Serve the MCP protocol on stdio (for Claude Code and other agents)
     Mcp,
+    /// Interactive dashboard: containers, images, volumes, compose projects
+    #[command(alias = "ui", alias = "desktop")]
+    Tui,
     #[command(name = "__vm", hide = true)]
     Vm,
     #[command(name = "__supervise", hide = true)]
@@ -903,6 +907,7 @@ fn real_main() -> Result<i32> {
             println!("Runtime: libkrun (Hypervisor.framework / KVM)");
         }
         Cmd::Mcp => mcp::serve(store)?,
+        Cmd::Tui => tui::run(store)?,
         Cmd::Supervise { id } => container::supervise(&store, &id)?,
         Cmd::Vm => unreachable!(),
     }

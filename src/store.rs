@@ -162,6 +162,18 @@ pub fn clone_tree(src: &Path, dst: &Path) -> Result<()> {
     if let Some(p) = dst.parent() {
         fs::create_dir_all(p)?;
     }
+    // clonefile(2) clones a whole directory tree in one call on APFS, far faster than
+    // `cp -c`, which clones file by file. Fall back to cp if it isn't possible.
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let s = std::ffi::CString::new(src.as_os_str().as_bytes())?;
+        let d = std::ffi::CString::new(dst.as_os_str().as_bytes())?;
+        const CLONE_NOFOLLOW: u32 = 1;
+        if unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), CLONE_NOFOLLOW) } == 0 {
+            return Ok(());
+        }
+    }
     let mut cmd = Command::new("cp");
     if cfg!(target_os = "macos") {
         cmd.arg("-cRp");

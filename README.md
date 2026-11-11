@@ -8,16 +8,58 @@ boot in well under a second. Agents drive it through an **MCP server** (`agentbo
 
 ## Install
 
-Needs Rust plus libkrun (Apple Silicon macOS, or Linux with KVM):
+agentbox runs on Apple Silicon Macs and needs libkrun from Homebrew:
 
 ```bash
-brew trust --formula slp/krun/libkrun && brew trust --formula slp/krun/virglrenderer-krun
+brew tap slp/krun
+brew trust --formula slp/krun/libkrun slp/krun/virglrenderer-krun   # newer Homebrew only
 brew install slp/krun/libkrun
+```
+
+**Ready-made binary:** each [release](https://github.com/jonra/agentbox/releases) has a
+signed `agentbox-macos-arm64.tar.gz`, built by GitHub Actions:
+
+```bash
+curl -fsSL https://github.com/jonra/agentbox/releases/latest/download/agentbox-macos-arm64.tar.gz | tar xz
+mkdir -p ~/.local/bin && mv agentbox/agentbox ~/.local/bin/
+agentbox version
+```
+
+If you downloaded the archive in a browser, clear the quarantine flag first:
+`xattr -d com.apple.quarantine ~/.local/bin/agentbox`.
+
+**From source** (needs Rust; Linux with KVM works too, with libkrun built from source):
+
+```bash
 make install            # builds, signs with the hypervisor entitlement, copies to ~/.local/bin
 ```
 
 Always build with `make`, not plain `cargo build`. macOS only allows Hypervisor.framework
 to binaries signed with `entitlements.plist`, and the Makefile signs the binary for you.
+
+## Dashboard
+
+`agentbox tui` (or `agentbox ui`) is a terminal dashboard in the spirit of Docker Desktop.
+
+- **Tabs:** containers, images, volumes and compose projects.
+- **Live stats:** CPU and memory per VM, ports, and each container's compose project.
+- **Containers:** `s` start/stop, `r` restart, `l` logs (follows), `x` exec a command,
+  `o` open the published port in the browser, `i` inspect, `d` delete.
+- **Images:** `r` runs one in the background, `p` pulls one.
+- **Compose:** projects can be started, stopped, restarted or taken down as a whole.
+- **Navigation:** `/` filters, `?` lists every key.
+
+```text
+ ◆ agentbox   3 running · 3 containers · 6 images · 1 volumes   CPU 8%  MEM 181 MB
+  1 Containers (3)     2 Images (6)     3 Volumes (1)     4 Compose (1)
+╭ Containers ──────────────────────────────────────────────────────────────────────────╮
+│   NAME            IMAGE            STATUS          PORTS            CPU    MEM   PROJECT │
+│▌● sleeper         alpine:3.20      Up 14 seconds                    2.7%   56 MB         │
+│ ● demo-cache-1    redis:7-alpine   Up 16 seconds   16379->6379/tcp  3.1%   63 MB  demo   │
+│ ● demo-web-1      nginx:alpine     Up 16 seconds   18088->80/tcp    2.2%   62 MB  demo   │
+╰──────────────────────────────────────────────────────────────────────────────────────╯
+  s start/stop  r restart  l logs  x exec  o open  i inspect  d delete  / filter  ? help
+```
 
 ## CLI
 
@@ -37,6 +79,7 @@ agentbox build -t myapp:dev --build-arg VERSION=1 .
 agentbox compose up -d --wait     # compose.yaml in this directory
 agentbox images | pull | rmi | tag SRC DST
 docker save myapp:latest | agentbox load    # bring images over from Docker
+agentbox tui                      # dashboard
 agentbox volume create|ls|rm   ·   agentbox container prune   ·   agentbox builder prune   ·   agentbox info|version
 ```
 
@@ -70,7 +113,9 @@ reads a classic Dockerfile and builds it without a daemon or BuildKit:
 - **`RUN`:** `RUN <<EOF` heredocs, `--mount=type=cache,target=…` (persists between builds),
   `--mount=type=bind` and `--network=none`. Each `RUN` boots the stage's filesystem in a
   microVM with networking.
-- **Layer cache:** after every filesystem step the tree is snapshotted with APFS clonefile.
+- **Layer cache:** after every filesystem step the tree is snapshotted with one APFS
+  `clonefile(2)` call (copy-on-write). With a multi-GB PyTorch venv in the stage, a `COPY`
+  step including its snapshot takes a few seconds.
   The key chains the parent key, the instruction, the environment and, for `COPY`/`ADD`, the
   content of the copied files. An unchanged prefix is reported as `CACHED`.
   `agentbox builder prune [-a]` clears the cache; `-a` also clears the cache mounts.
@@ -164,6 +209,11 @@ number of `exec` calls in the same environment, then `remove_container`. For a w
 
 The EPCOR Spring Boot project builds and runs under agentbox:
 
+- **`agentbox build` (ML worker):** the PyTorch worker's Dockerfile builds unchanged in about
+  9.5 minutes. It has three stages (uv, build, and a distroless runtime). The build stage
+  downloads Python, runs `uv pip install` from a hash-locked lockfile, bakes model weights
+  and scans shared libraries with `ldd`/`dpkg`; the runtime stage uses `COPY --from --chown`.
+  The image runs Python 3.12 and torch 2.14.
 - **`agentbox build`:** the app's Dockerfile builds unchanged in about 5 minutes on the
   first run, mostly Maven downloads. It has two stages with pinned digests (Maven, then
   Temurin JRE), with `RUN`s that create users and `COPY --from`.
